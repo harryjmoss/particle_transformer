@@ -36,6 +36,16 @@ Installing a version of pytorch compiled against the correct version of CUDA sav
 
 Downloads the JetClass dataset to `./datasets`
 
+The entire dataset is downloaded from zenodo and is available at [this link](https://zenodo.org/records/6619768)
+
+Dataset is NOT gzipped, but is tarballed. Total size 189.8 GB
+
+On an Ada VM, downloading at roughly 110 MiB/s.
+
+- The training data consists of 1000 `.root` files, all from 107-201 MB (probably averaging at 150 MB).
+- Similarly the Validation data consists of 50 of the same size root files.
+- Test data consists of 200 files with the same range of file sizes.
+
 ## Run the suggested training loop with the suggested settings
 
 ```sh
