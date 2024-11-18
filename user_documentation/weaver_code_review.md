@@ -1,5 +1,6 @@
+# Weaver code overview
 
-This looks at the code underlying `particle_transformer`.
+This document looks at the neural network training framework underpinning [particle transformer](https://github.com/jet-universe/particle_transformer). Code is contained in the [weaver-core](https://github.com/hqucms/weaver-core) repository.
 
 We'll start with the `main` function called by the `weaver` command (obtained after `pip` installing `weaver-core` or running `setup.py` from the root of the `weaver-core` repo) and then work out at which point a forward pass for our ParticleTransformer model is called.
 
