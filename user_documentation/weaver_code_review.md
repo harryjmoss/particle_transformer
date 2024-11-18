@@ -22,26 +22,25 @@ where `samples-per-epoch` and `samples-per-epoch-val` are reduced to 1024 and 12
 
 ### Definition of arguments passed to weaver
 
-`--data-train` - path to training data
-`--data-val` - path to validation data
-`--data-test` - path to test data
-`--data-config` - path to data config yaml. Which variables do we need from the data? Any selections/cuts to make?
-`--network-config` - this is a python file that defines a model wrapper. Here we have `ParticleTransformerWrapper`, supers torch.nn.Module and has a `self.mod` attribute that actually loads the model, defined in `weaver.nn.model.ParticleTransformer` - look here for the actual model architecture. This really is just providing a function `get_model` to load the model with particular parameters set, like embed dimensions, number of heads, number of layers, activation functions etc AND ALSO a function `get_loss`to define the loss as cross entropy loss.
+`--data-train` - path to training data  
+`--data-val` - path to validation data  
+`--data-test` - path to test data  
+`--data-config` - path to data config yaml. Which variables do we need from the data? Any selections/cuts to make?  
+`--network-config` - this is a python file that defines a model wrapper. Here we have `ParticleTransformerWrapper`, supers torch.nn.Module and has a `self.mod` attribute that actually loads the model, defined in `weaver.nn.model.ParticleTransformer` - look here for the actual model architecture. This really is just providing a function `get_model` to load the model with particular parameters set, like embed dimensions, number of heads, number of layers, activation functions etc AND ALSO a function `get_loss`to define the loss as cross entropy loss.  
 `--use-amp` - flag to define if we should use mixed precision training (fp16). This is set to true if the flag is present.
-`--model-prefix` - path to save or load the model.
-`--num-workers` Number of workers to use, running a process each. Setting this to zero turns this off and runs as a single process. It's really "number of additional processes" or something like that!
-`--fetch-step` - fraction/chunk of events to load from each input file, before being randomly shuffled and fed into the training pipeline. The chunk size is set by this flag and defaults to 0.01, which corresponds to 10% of events (I think actually 1%...) to be loaded from each file in every step. **This is the default strategy** - motivated by physics/HEP experiments, where each input files originates from a specific physics process, and only contains events of a particular type (or in a limited phase space). This is motivated by providing a good mixture of events, but requires high reading throughput of data storage (they suggest SSD), otherwise you have a data loading bottleneck.
+`--model-prefix` - path to save or load the model.  
+`--num-workers` Number of workers to use, running a process each. Setting this to zero turns this off and runs as a single process. It's really "number of additional processes" or something like that!  
+`--fetch-step` - fraction/chunk of events to load from each input file, before being randomly shuffled and fed into the training pipeline. The chunk size is set by this flag and defaults to 0.01, which corresponds to 10% of events (I think actually 1%...) to be loaded from each file in every step. **This is the default strategy** - motivated by physics/HEP experiments, where each input files originates from a specific physics process, and only contains events of a particular type (or in a limited phase space). This is motivated by providing a good mixture of events, but requires high reading throughput of data storage (they suggest SSD), otherwise you have a data loading bottleneck.  
 `--batch-size`is batch size. Even the argparser doesn't give you more than that!
-`--start-lr` the starting learning rate. Not clear what the scheduler is at this stage.
+`--start-lr` the starting learning rate. Not clear what the scheduler is at this stage.  
 `--samples-per-epoch` - number of samples loaded per epoch. Note that if this isn't set OR `--steps-per-epoch-val` is set, then each epoch will run over all loaded samples. Seems odd to me - surely an epoch is your entire training data set?
-`--samples-per-epoch-val` - samples per epoch for validation.  See above for the behaviour if this isn't set OR regular `samples-per-epoch`
-`--num-epochs` number of epochs
-`--gpus` zero-indexed device for setting which GPUs are used. A blank string here uses the CPU. 0 uses device 0, or the first available GPU.
-`--optimizer` - sets the optimizer for the training.
-`--log` path to the log file. `{auto}` is allowed and auto generates a name based on timestamp.
-`--predict-output` save any prediction output to this path
-`--tensorboard` creates a tensorboard summary writer with the given comment
-
+`--samples-per-epoch-val` - samples per epoch for validation.  See above for the behaviour if this isn't set OR regular `samples-per-epoch`  
+`--num-epochs` number of epochs  
+`--gpus` zero-indexed device for setting which GPUs are used. A blank string here uses the CPU. 0 uses device 0, or the first available GPU.  
+`--optimizer` - sets the optimizer for the training.  
+`--log` path to the log file. `{auto}` is allowed and auto generates a name based on timestamp.  
+`--predict-output` save any prediction output to this path  
+`--tensorboard` creates a tensorboard summary writer with the given comment  
 
 That's it.
 
@@ -55,9 +54,7 @@ That's it.
 - there's even a `--profile` flag which "run(s) the profiler".
   - this actually uses the torch profiler!
 
-
-The main function is really bloated and quite messy. Loads of flags. Training loop demarcated by a comment.
-
+The main function is a little bloated and hard to follow, using multiple boolean flags to define behaviour in a single function. The training loop is demarcated by a comment, inside a boolean-scoped block.
 
 Adding the `--profile` flag to our default training command locally (MacOS, M3 chip) results in an output like this:
 
