@@ -95,21 +95,22 @@ This is found in `weaver.utils.nn.tools` - both `train_classification` and `trai
 
 A closer look at the model we're attempting to train...
 
-Compound physics variables like angular difference, squared mass and squared transverse momentum are defined early in `weaver.nn.model.ParticleTransformer`and are referred to later in the code. Similar for boosting rest frames. 
+- Compound physics variables like angular difference, squared mass and squared transverse momentum are defined early in `weaver.nn.model.ParticleTransformer`and are referred to later in the code. Similar for boosting rest frames. 
 
-`Embed` and `PairEmbed` classes generate embeddings, either pairwise or (I think) for the input layer. From the paper, the particle and interaction inputs are each followed by an MLP to project them to d and d' dimensional embeddings, respectively. No ad-hoc positional encodings are given as particles in a jet are permutation invariant. Particle embeddings are then fed into a stack of attention blocks to generate new embeddings via multi-head self attention.
+- `Embed` and `PairEmbed` classes generate embeddings, either pairwise or (I think) for the input layer. From the paper, the particle and interaction inputs are each followed by an MLP to project them to d and d' dimensional embeddings, respectively. No ad-hoc positional encodings are given as particles in a jet are permutation invariant. Particle embeddings are then fed into a stack of attention blocks to generate new embeddings via multi-head self attention.
 
-Pairwise features are encoded separately and I think will use the `PairEmbed` class
-No type hinting makes this quite a painful process.
+- Pairwise features are encoded separately and I think will use the `PairEmbed` class. A lack of type hinting makes this quite a painful process to follow.
 
-Lots of the classes (particularly the pairwise embedding) could use a refactor.
+- Lots of the classes (particularly the pairwise embedding) could use a refactor.
 
-Define a `Block` class that just contains a forward pass.
+- Define a `Block` class that just contains a forward pass.
 
-The main actual `ParticleTransformer`class is finally defined!
+- The main actual `ParticleTransformer`class is finally defined!
+
+Figure 1 from the paper shows the model architecture, which is a stack of Particle Attention Blocks followed by a stack of Class Attention Blocks. The model is then followed by a fully connected layer and a softmax layer.
 
 ![The ParticleTransformer model architecture.](particle_transformer_architecture.png)
-
+Figure 1. Model architecture diagram taken from the [ParticleTransformer paper](https://arxiv.org/abs/2202.03772).
 
 ### Forward pass
 
