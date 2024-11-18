@@ -42,3 +42,19 @@ Downloads the JetClass dataset to `./datasets`
 ./train_JetClass.sh ParT full
 ```
 
+## Performance testing
+
+```sh
+time ./train_JetClass.sh ParT full
+```
+
+Results:
+
+```sh
+real 2210m34.033s
+user 3043m28.783s
+sys 1715m57.355s
+```
+
+N.B.: Real time == wall time
+Wall time was 36 hours 50 minutes 34.033 seconds.
