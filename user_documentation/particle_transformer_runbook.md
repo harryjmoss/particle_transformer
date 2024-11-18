@@ -58,3 +58,5 @@ sys 1715m57.355s
 
 N.B.: Real time == wall time
 Wall time was 36 hours 50 minutes 34.033 seconds.
+
+On Ada VM with 1x NVIDIA A100 GPU.
