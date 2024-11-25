@@ -4,10 +4,10 @@ import torch
 import copy
 import json
 import time
-
+import logging
 import numpy as np
 import awkward as ak
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from torch.utils.data import DataLoader
 from concurrent.futures.thread import ThreadPoolExecutor
 
@@ -24,6 +24,7 @@ from weaver.utils.dataset import (
     _preprocess,
     _load_next
 )
+from weaver.utils.data.preprocess import AutoStandardizer, WeightMaker
 from weaver.utils.data.config import DataConfig, _md5
 from weaver.train import model_setup
 
@@ -317,9 +318,11 @@ class ArgumentsObject:
     copy_inputs: bool = False
     data_config: str = "data/JetClass/JetClass_full.yaml"
     network_config: str = "networks/example_ParticleTransformer.py"
-    network_option: list = []
+    network_option: dict = field(default_factory=lambda: {})
     use_amp: bool = True
     model_prefix: str = "training/JetClass/Pythia/full/ParT/{auto}/net"
+    export_onnx: bool = False
+    load_model_weights: bool = False
     num_workers: int = 0
     fetch_step: float = 0.01
     batch_size: int = 32
@@ -327,7 +330,7 @@ class ArgumentsObject:
     samples_per_epoch: int = 1024
     samples_per_epoch_val: int = 1024
     num_epochs: int = 1
-    gpus: str = "0"
+    gpus: str = ""
     optimizer: str = "ranger"
     log: str = "logs/JetClass_Pythia_full_ParT_{auto}.log"
     predict_output: str = "pred.root"
@@ -359,18 +362,22 @@ def get_dataloaders(train_data: SimpleIterDataset, val_data: SimpleIterDataset, 
 
     return train_loader, val_loader
 
+class InterceptHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        logger.opt(depth=6, exception=record.exc_info).log(record.levelno, record.getMessage())
 
 def main():
 
     logger.remove() 
     logger.add(sys.stdout, level="INFO")
+    logging.basicConfig(handlers=[InterceptHandler()], level="INFO")
     
-    dev = torch.device(0)
     args_val = ["datasets/JetClass/Pythia/val_5M/*.root"]
     args_train = ['HToBB:datasets/JetClass/Pythia/train_100M/HToBB_*.root', 'HToCC:datasets/JetClass/Pythia/train_100M/HToCC_*.root', 'HToGG:datasets/JetClass/Pythia/train_100M/HToGG_*.root', 'HToWW2Q1L:datasets/JetClass/Pythia/train_100M/HToWW2Q1L_*.root', 'HToWW4Q:datasets/JetClass/Pythia/train_100M/HToWW4Q_*.root', 'TTBar:datasets/JetClass/Pythia/train_100M/TTBar_*.root', 'TTBarLep:datasets/JetClass/Pythia/train_100M/TTBarLep_*.root', 'WToQQ:datasets/JetClass/Pythia/train_100M/WToQQ_*.root', 'ZToQQ:datasets/JetClass/Pythia/train_100M/ZToQQ_*.root', 'ZJetsToNuNu:datasets/JetClass/Pythia/train_100M/ZJetsToNuNu_*.root']
     args_test = ['HToBB:datasets/JetClass/Pythia/test_20M/HToBB_*.root' 'HToCC:datasets/JetClass/Pythia/test_20M/HToCC_*.root' 'HToGG:datasets/JetClass/Pythia/test_20M/HToGG_*.root' 'HToWW2Q1L:datasets/JetClass/Pythia/test_20M/HToWW2Q1L_*.root' 'HToWW4Q:datasets/JetClass/Pythia/test_20M/HToWW4Q_*.root' 'TTBar:datasets/JetClass/Pythia/test_20M/TTBar_*.root' 'TTBarLep:datasets/JetClass/Pythia/test_20M/TTBarLep_*.root' 'WToQQ:datasets/JetClass/Pythia/test_20M/WToQQ_*.root' 'ZToQQ:datasets/JetClass/Pythia/test_20M/ZToQQ_*.root' 'ZJetsToNuNu:datasets/JetClass/Pythia/test_20M/ZJetsToNuNu_*.root']
     
     args = ArgumentsObject(args_val, args_train, args_test)
+    dev = torch.device(0) if args.gpus == "0" else torch.device("cpu")
 
     train_data, val_data, data_config = get_datasets(args)
 
@@ -402,13 +409,29 @@ def main():
         if i==1:
             elapsed_time = time.time() - first_batch_loaded_time
             logger.info(f"Second batch loading time {elapsed_time:.2f}s")
+            batch_list.append(batch)
+
         if i>1:
             break
 
         
     model, model_info, loss_func = model_setup(args, data_config, device=dev)
+    logger.info(f"{model_info=}")
+    for batch in batch_list:
+        for X, y, _ in batch_list:
+            inputs = [X[k].to(dev) for k in data_config.input_names]
+            label = y[data_config.label_names[0]].long().to(dev)
+            try:
+                mask = y[data_config.label_names[0] + "_mask"].bool().to(dev)
+            except KeyError:
+                mask = None
+            
+            # model call goes here
+            logger.info(f"inputs: {inputs}\nlabels: {label}\nmask: {mask}")
+            # but hack apart the model to figure out what's getting passed and when...
 
-    
+            model(*inputs)
+            break # just one item per batch
     return args, data_config, train_loader, val_loader, batch_list
 if __name__ == "__main__":
     main()
