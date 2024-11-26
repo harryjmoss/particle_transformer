@@ -429,20 +429,24 @@ def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, da
         
         logger.info(f"inputs: {inputs}\nlabels: {label}\nmask: {mask}")
 
-        profile_forward_pass(model, inputs)
+        profile_forward_pass(model, inputs, dev)
         num_batches += 1
 
         if num_batches >= steps_per_epoch:
             break
 
 
-def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor]) -> None:
+def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor], dev: torch.device) -> None:
     """Profile the forward pass of the model.
 
     Args:
         model (ParticleTransformer): The model to profile.
         inputs (list[torch.Tensor]): List of input tensors.
     """
+    if dev.type == "cuda":
+        sort_by_keyword = dev.type + "_time_total"
+    else:
+        sort_by_keyword = "cpu_time_total"
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -454,7 +458,7 @@ def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor])
         
         _outputs = model(*inputs)
     logger.debug(f"Outputs shape: {_outputs.shape}")
-    results = prof.key_averages().table(sort_by="cpu_time_total", row_limit=10)
+    results = prof.key_averages().table(sort_by=sort_by_keyword, row_limit=10)
 
     logger.info(f"{results}")
 
