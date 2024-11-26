@@ -9,6 +9,7 @@ import numpy as np
 import awkward as ak
 from dataclasses import dataclass, field
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 from concurrent.futures.thread import ThreadPoolExecutor
 
 
@@ -27,7 +28,7 @@ from weaver.utils.dataset import (
 from weaver.utils.data.preprocess import AutoStandardizer, WeightMaker
 from weaver.utils.data.config import DataConfig, _md5
 from weaver.train import model_setup
-
+from weaver.nn.model.ParticleTransformer import ParticleTransformer
 from loguru import logger
 
 training_mode = True
@@ -325,10 +326,10 @@ class ArgumentsObject:
     load_model_weights: bool = False
     num_workers: int = 0
     fetch_step: float = 0.01
-    batch_size: int = 32
+    batch_size: int = 512
     start_lr: float = 1e-3
-    samples_per_epoch: int = 1024
-    samples_per_epoch_val: int = 1024
+    samples_per_epoch: int = 513
+    samples_per_epoch_val: int = 513
     num_epochs: int = 1
     gpus: str = ""
     optimizer: str = "ranger"
@@ -341,9 +342,9 @@ class ArgumentsObject:
 def get_datasets(args: ArgumentsObject):
     
 
-    train_file_dict, train_files = to_filelist(args, "train")
+    train_file_dict, _train_files = to_filelist(args, "train")
 
-    val_file_dict, val_files = to_filelist(args, "val")
+    val_file_dict, _val_files = to_filelist(args, "val")
 
     train_range = val_range = (0, 1)
     
@@ -366,23 +367,23 @@ class InterceptHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         logger.opt(depth=6, exception=record.exc_info).log(record.levelno, record.getMessage())
 
-def main():
+def set_up_logging():
+    """Redirects the logging to the loguru logger."""
 
     logger.remove() 
     logger.add(sys.stdout, level="INFO")
     logging.basicConfig(handlers=[InterceptHandler()], level="INFO")
-    
-    args_val = ["datasets/JetClass/Pythia/val_5M/*.root"]
-    args_train = ['HToBB:datasets/JetClass/Pythia/train_100M/HToBB_*.root', 'HToCC:datasets/JetClass/Pythia/train_100M/HToCC_*.root', 'HToGG:datasets/JetClass/Pythia/train_100M/HToGG_*.root', 'HToWW2Q1L:datasets/JetClass/Pythia/train_100M/HToWW2Q1L_*.root', 'HToWW4Q:datasets/JetClass/Pythia/train_100M/HToWW4Q_*.root', 'TTBar:datasets/JetClass/Pythia/train_100M/TTBar_*.root', 'TTBarLep:datasets/JetClass/Pythia/train_100M/TTBarLep_*.root', 'WToQQ:datasets/JetClass/Pythia/train_100M/WToQQ_*.root', 'ZToQQ:datasets/JetClass/Pythia/train_100M/ZToQQ_*.root', 'ZJetsToNuNu:datasets/JetClass/Pythia/train_100M/ZJetsToNuNu_*.root']
-    args_test = ['HToBB:datasets/JetClass/Pythia/test_20M/HToBB_*.root' 'HToCC:datasets/JetClass/Pythia/test_20M/HToCC_*.root' 'HToGG:datasets/JetClass/Pythia/test_20M/HToGG_*.root' 'HToWW2Q1L:datasets/JetClass/Pythia/test_20M/HToWW2Q1L_*.root' 'HToWW4Q:datasets/JetClass/Pythia/test_20M/HToWW4Q_*.root' 'TTBar:datasets/JetClass/Pythia/test_20M/TTBar_*.root' 'TTBarLep:datasets/JetClass/Pythia/test_20M/TTBarLep_*.root' 'WToQQ:datasets/JetClass/Pythia/test_20M/WToQQ_*.root' 'ZToQQ:datasets/JetClass/Pythia/test_20M/ZToQQ_*.root' 'ZJetsToNuNu:datasets/JetClass/Pythia/test_20M/ZJetsToNuNu_*.root']
-    
-    args = ArgumentsObject(args_val, args_train, args_test)
-    dev = torch.device(0) if args.gpus == "0" else torch.device("cpu")
 
-    train_data, val_data, data_config = get_datasets(args)
+def get_first_n_batches(n: int, train_loader: DataLoader) -> list[torch.Tensor]:
+    """Get the first n batches from the train_loader.
 
-    train_loader, val_loader = get_dataloaders(train_data, val_data, args)
+    Args:
+        n (int): Number of batches to return.
+        train_loader (DataLoader): Pytorch DataLoader object.
 
+    Returns:
+        list[torch.Tensor]: List of tensors containing the first n batches.
+    """
 
     start_time = time.time()
 
@@ -390,48 +391,106 @@ def main():
     
     
     for i, batch in enumerate(train_loader):
-        print(f"{i=}")
         if i==0:
             first_batch_loaded_time = time.time()
             elapsed_time = first_batch_loaded_time - start_time
-
-
-            batch_list.append(batch)
             batch_length = len(batch)
             pf_points_shape = batch[0]["pf_points"].shape
             pf_features_shape = batch[0]["pf_features"].shape
             pf_vectors_shape = batch[0]["pf_vectors"].shape
             pf_mask_shape = batch[0]["pf_mask"].shape
 
-            logger.info(f"{batch[0].keys()}")
-            logger.info(f"{batch_length=}, {pf_points_shape=}, {pf_features_shape=}, {pf_vectors_shape=}, {pf_mask_shape=}")
-            logger.info(f"Single batch loading time {elapsed_time:.2f}s")
-        if i==1:
-            elapsed_time = time.time() - first_batch_loaded_time
-            logger.info(f"Second batch loading time {elapsed_time:.2f}s")
+            logger.debug(f"{batch[0].keys()}")
+            logger.debug(f"{batch_length=}, {pf_points_shape=}, {pf_features_shape=}, {pf_vectors_shape=}, {pf_mask_shape=}")
+            logger.debug(f"Single batch loading time {elapsed_time:.2f}s")
+        if i<n:
             batch_list.append(batch)
+        else:
+            break
+    return batch_list
 
-        if i>1:
+def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, data_config: dict, dev: torch.device, steps_per_epoch: int) -> None:
+    """Call the forward pass of the model.
+
+    Args:
+        model (ParticleTransformer): ParticleTransformer model.
+        training_input (DataLoader): Pytorch DataLoader object.
+        data_config (dict): Data configuration dictionary.
+        dev (torch.device): Pytorch device to run the model on.
+    """
+    num_batches = 0
+    for X, y, _ in tqdm(training_input):
+        inputs = [X[k].to(dev) for k in data_config.input_names]
+        label = y[data_config.label_names[0]].long().to(dev)
+        try:
+            mask = y[data_config.label_names[0] + "_mask"].bool().to(dev)
+        except KeyError:
+            mask = None
+        
+        logger.info(f"inputs: {inputs}\nlabels: {label}\nmask: {mask}")
+
+        profile_forward_pass(model, inputs)
+        num_batches += 1
+
+        if num_batches >= steps_per_epoch:
             break
 
-        
-    model, model_info, loss_func = model_setup(args, data_config, device=dev)
-    logger.info(f"{model_info=}")
-    for batch in batch_list:
-        for X, y, _ in batch_list:
-            inputs = [X[k].to(dev) for k in data_config.input_names]
-            label = y[data_config.label_names[0]].long().to(dev)
-            try:
-                mask = y[data_config.label_names[0] + "_mask"].bool().to(dev)
-            except KeyError:
-                mask = None
-            
-            # model call goes here
-            logger.info(f"inputs: {inputs}\nlabels: {label}\nmask: {mask}")
-            # but hack apart the model to figure out what's getting passed and when...
 
-            model(*inputs)
-            break # just one item per batch
-    return args, data_config, train_loader, val_loader, batch_list
+def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor]) -> None:
+    """Profile the forward pass of the model.
+
+    Args:
+        model (ParticleTransformer): The model to profile.
+        inputs (list[torch.Tensor]): List of input tensors.
+    """
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        with_flops=True,
+        profile_memory=True,
+    ) as prof:
+        
+        _outputs = model(*inputs)
+    logger.debug(f"Outputs shape: {_outputs.shape}")
+    results = prof.key_averages().table(sort_by="cpu_time_total", row_limit=10)
+
+    logger.info(f"{results}")
+
+    prof.export_chrome_trace("profiler_trace.json")
+
+
+
+def main():
+    """Main entry point of the script."""
+   
+    args_val = ["datasets/JetClass/Pythia/val_5M/*.root"]
+    args_train = ['HToBB:datasets/JetClass/Pythia/train_100M/HToBB_*.root', 'HToCC:datasets/JetClass/Pythia/train_100M/HToCC_*.root', 'HToGG:datasets/JetClass/Pythia/train_100M/HToGG_*.root', 'HToWW2Q1L:datasets/JetClass/Pythia/train_100M/HToWW2Q1L_*.root', 'HToWW4Q:datasets/JetClass/Pythia/train_100M/HToWW4Q_*.root', 'TTBar:datasets/JetClass/Pythia/train_100M/TTBar_*.root', 'TTBarLep:datasets/JetClass/Pythia/train_100M/TTBarLep_*.root', 'WToQQ:datasets/JetClass/Pythia/train_100M/WToQQ_*.root', 'ZToQQ:datasets/JetClass/Pythia/train_100M/ZToQQ_*.root', 'ZJetsToNuNu:datasets/JetClass/Pythia/train_100M/ZJetsToNuNu_*.root']
+    args_test = ['HToBB:datasets/JetClass/Pythia/test_20M/HToBB_*.root' 'HToCC:datasets/JetClass/Pythia/test_20M/HToCC_*.root' 'HToGG:datasets/JetClass/Pythia/test_20M/HToGG_*.root' 'HToWW2Q1L:datasets/JetClass/Pythia/test_20M/HToWW2Q1L_*.root' 'HToWW4Q:datasets/JetClass/Pythia/test_20M/HToWW4Q_*.root' 'TTBar:datasets/JetClass/Pythia/test_20M/TTBar_*.root' 'TTBarLep:datasets/JetClass/Pythia/test_20M/TTBarLep_*.root' 'WToQQ:datasets/JetClass/Pythia/test_20M/WToQQ_*.root' 'ZToQQ:datasets/JetClass/Pythia/test_20M/ZToQQ_*.root' 'ZJetsToNuNu:datasets/JetClass/Pythia/test_20M/ZJetsToNuNu_*.root']
+    
+    args = ArgumentsObject(args_val, args_train, args_test)
+    dev = torch.device(0) if args.gpus == "0" else torch.device("cpu")
+
+    set_up_logging()
+    train_data, val_data, data_config = get_datasets(args)
+
+    train_loader, val_loader = get_dataloaders(train_data, val_data, args)
+
+
+    n_batch_list = get_first_n_batches(n=2, train_loader=train_loader)
+        
+    model, model_info, _loss_func = model_setup(args, data_config, device=dev)
+    logger.info(f"{model_info=}")
+    
+
+    steps_per_epoch = args.samples_per_epoch // args.batch_size
+    _steps_per_epoch_val = args.samples_per_epoch_val // args.batch_size
+
+
+    # Runs over a single epoch
+    call_forward_pass(model, train_loader, data_config, dev, steps_per_epoch)
+
+    return args, data_config, train_loader, val_loader, n_batch_list
 if __name__ == "__main__":
     main()
