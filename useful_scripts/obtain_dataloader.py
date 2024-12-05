@@ -433,8 +433,9 @@ def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, da
         num_batches += 1
 
         if num_batches >= steps_per_epoch:
+            input_shapes = [k.shape for k in inputs]
+            logger.info(f"Processed {num_batches} batches of inputs with shape {input_shapes}")
             break
-
 
 def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor], dev: torch.device) -> None:
     """Profile the forward pass of the model.
@@ -443,10 +444,12 @@ def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor],
         model (ParticleTransformer): The model to profile.
         inputs (list[torch.Tensor]): List of input tensors.
     """
+    # turn off gradient accumulation...
+    model.eval()
     if dev.type == "cuda":
-        sort_by_keyword = dev.type + "_time_total"
+        sort_by_keyword = "self_" + dev.type + "_time_total"
     else:
-        sort_by_keyword = "cpu_time_total"
+        sort_by_keyword = "self_cpu_time_total"
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -454,6 +457,7 @@ def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor],
         ],
         with_flops=True,
         profile_memory=True,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("tensorboard_logs")
     ) as prof:
         
         _outputs = model(*inputs)
@@ -461,8 +465,8 @@ def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor],
     results = prof.key_averages().table(sort_by=sort_by_keyword, row_limit=10)
 
     logger.info(f"{results}")
-
-    prof.export_chrome_trace("profiler_trace.json")
+    
+    #prof.export_chrome_trace("./chrome_traces")
 
 
 
@@ -474,7 +478,10 @@ def main():
     args_test = ['HToBB:datasets/JetClass/Pythia/test_20M/HToBB_*.root' 'HToCC:datasets/JetClass/Pythia/test_20M/HToCC_*.root' 'HToGG:datasets/JetClass/Pythia/test_20M/HToGG_*.root' 'HToWW2Q1L:datasets/JetClass/Pythia/test_20M/HToWW2Q1L_*.root' 'HToWW4Q:datasets/JetClass/Pythia/test_20M/HToWW4Q_*.root' 'TTBar:datasets/JetClass/Pythia/test_20M/TTBar_*.root' 'TTBarLep:datasets/JetClass/Pythia/test_20M/TTBarLep_*.root' 'WToQQ:datasets/JetClass/Pythia/test_20M/WToQQ_*.root' 'ZToQQ:datasets/JetClass/Pythia/test_20M/ZToQQ_*.root' 'ZJetsToNuNu:datasets/JetClass/Pythia/test_20M/ZJetsToNuNu_*.root']
     
     args = ArgumentsObject(args_val, args_train, args_test)
-    dev = torch.device(0) if args.gpus == "0" else torch.device("cpu")
+    #dev = torch.device(0) if args.gpus == "0" else torch.device("cpu")
+    
+    dev = torch.device(0) if torch.cuda.is_available() else torch.device("cpu")
+    logger.info(f"Using device {dev}")
 
     set_up_logging()
     train_data, val_data, data_config = get_datasets(args)
@@ -485,6 +492,7 @@ def main():
     n_batch_list = get_first_n_batches(n=2, train_loader=train_loader)
         
     model, model_info, _loss_func = model_setup(args, data_config, device=dev)
+    model.to(dev)
     logger.info(f"{model_info=}")
     
 
