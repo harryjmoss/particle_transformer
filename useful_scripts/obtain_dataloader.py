@@ -11,11 +11,13 @@ from dataclasses import dataclass, field
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from concurrent.futures.thread import ThreadPoolExecutor
-
+import argparse
 
 from weaver.utils.nn.tools import train_classification as train
 from weaver.utils.nn.tools import evaluate_classification as evaluate
-from weaver.train import to_filelist
+from weaver.train import to_filelist, optim
+from weaver.utils.nn.tools import _flatten_preds
+
 
 from weaver.utils.dataset import (
     _collate_awkward_array_fn,
@@ -355,10 +357,10 @@ def get_datasets(args: ArgumentsObject):
 
     return train_data, val_data, data_config
 
-def get_dataloaders(train_data: SimpleIterDataset, val_data: SimpleIterDataset, args: ArgumentsObject):
+def get_dataloaders(train_data: SimpleIterDataset, val_data: SimpleIterDataset, batch_size: int):
 
-    train_loader = DataLoader(train_data, batch_size=args.batch_size, drop_last=True, pin_memory=True, num_workers=0, persistent_workers=False)
-    val_loader = DataLoader(val_data, batch_size=args.batch_size, drop_last=True, pin_memory=True, num_workers=0, persistent_workers=False)
+    train_loader = DataLoader(train_data, batch_size=batch_size, drop_last=True, pin_memory=True, num_workers=0, persistent_workers=False)
+    val_loader = DataLoader(val_data, batch_size=batch_size, drop_last=True, pin_memory=True, num_workers=0, persistent_workers=False)
 
 
     return train_loader, val_loader
@@ -409,7 +411,7 @@ def get_first_n_batches(n: int, train_loader: DataLoader) -> list[torch.Tensor]:
             break
     return batch_list
 
-def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, data_config: dict, dev: torch.device, steps_per_epoch: int) -> None:
+def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, data_config: dict, dev: torch.device, steps_per_epoch: int, batch_size: int, timer: bool) -> None:
     """Call the forward pass of the model.
 
     Args:
@@ -417,6 +419,9 @@ def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, da
         training_input (DataLoader): Pytorch DataLoader object.
         data_config (dict): Data configuration dictionary.
         dev (torch.device): Pytorch device to run the model on.
+        steps_per_epoch (int): Number of steps per epoch.
+        batch_size (int): Batch size.
+        timer (bool): Time the forward pass.
     """
     num_batches = 0
     for X, y, _ in tqdm(training_input):
@@ -429,7 +434,13 @@ def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, da
         
         logger.info(f"inputs: {inputs}\nlabels: {label}\nmask: {mask}")
 
-        profile_forward_pass(model, inputs, dev)
+        if timer:
+            model.eval()
+            model(*inputs)
+        
+        else:
+            profile_forward_pass(model, inputs, dev, batch_size=batch_size)
+
         num_batches += 1
 
         if num_batches >= steps_per_epoch:
@@ -437,12 +448,15 @@ def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, da
             logger.info(f"Processed {num_batches} batches of inputs with shape {input_shapes}")
             break
 
-def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor], dev: torch.device) -> None:
+
+def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor], dev: torch.device, batch_size: int) -> None:
     """Profile the forward pass of the model.
 
     Args:
         model (ParticleTransformer): The model to profile.
         inputs (list[torch.Tensor]): List of input tensors.
+        dev (torch.device): Pytorch device to run the model on.
+        batch_size (int): Batch size.
     """
     # turn off gradient accumulation...
     model.eval()
@@ -457,7 +471,7 @@ def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor],
         ],
         with_flops=True,
         profile_memory=True,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler("tensorboard_logs")
+        #on_trace_ready=torch.profiler.tensorboard_trace_handler("tensorboard_logs_forward")
     ) as prof:
         
         _outputs = model(*inputs)
@@ -466,13 +480,107 @@ def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor],
 
     logger.info(f"{results}")
     
-    #prof.export_chrome_trace("./chrome_traces")
+    prof.export_chrome_trace(f"./single_epoch_forward_pass_batch_size_{batch_size}.json")
+
+
+def call_forward_and_backward_pass(args: ArgumentsObject, model: ParticleTransformer, training_input: DataLoader, data_config: dict, dev: torch.device, steps_per_epoch: int, batch_size: int) -> None:
+    """Call the forward pass of the model.
+
+    Args:
+        args (ArgumentsObject): Arguments object.
+        model (ParticleTransformer): ParticleTransformer model.
+        training_input (DataLoader): Pytorch DataLoader object.
+        data_config (dict): Data configuration dictionary.
+        dev (torch.device): Pytorch device to run the model on.
+        steps_per_epoch (int): Number of steps per epoch.
+        batch_size (int): Batch size.
+    """
+    num_batches = 0
+    opt = optim(args, model, dev)
+    for X, y, _ in tqdm(training_input):
+        inputs = [X[k].to(dev) for k in data_config.input_names]
+        label = y[data_config.label_names[0]].long().to(dev)
+        try:
+            mask = y[data_config.label_names[0] + "_mask"].bool().to(dev)
+        except KeyError:
+            mask = None
+        
+        logger.info(f"inputs: {inputs}\nlabels: {label}\nmask: {mask}")
+
+        profile_forward_backward_pass(opt, model, inputs, mask, label, dev, batch_size)
+        num_batches += 1
+
+        if num_batches >= steps_per_epoch:
+            input_shapes = [k.shape for k in inputs]
+            logger.info(f"Processed {num_batches} batches of inputs with shape {input_shapes}")
+            break
+
+
+
+
+def profile_forward_backward_pass(
+        opt: torch.optim,
+        model: ParticleTransformer,
+        loss_func: torch.nn.modules.loss._Loss,
+        inputs: list[torch.Tensor],
+        mask: list[torch.Tensor],
+        label: list[torch.Tensor],
+        dev: torch.device,
+        batch_size: int
+    ) -> None:
+    """Profile the backward pass of the model.
+
+    Args:
+        opt (torch.optim): The optimizer to use.
+        model (ParticleTransformer): The model to profile.
+        loss_func (torch.nn.modules.loss._Loss): The loss function to use.
+        inputs (list[torch.Tensor]): List of input tensors.
+        mask (list[torch.Tensor]): List of mask tensors.
+        label (list[torch.Tensor]): List of label tensors.
+        dev (torch.device): Pytorch device to run the model on.
+        batch_size (int): Batch size.
+    """
+    if dev.type == "cuda":
+        sort_by_keyword = "self_" + dev.type + "_time_total"
+    else:
+        sort_by_keyword = "self_cpu_time_total"
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        with_flops=True,
+        profile_memory=True,
+        #on_trace_ready=torch.profiler.tensorboard_trace_handler("tensorboard_logs_backward")
+    ) as prof:
+        
+        opt.zero_grad()
+        with torch.amp.autocast(dev):
+            model_output = model(*inputs)
+            logits, label, _ = _flatten_preds(model_output, label=label, mask=mask)
+            loss = loss_func(logits, label)
+            loss.backward()
+            opt.step()
+        
+    logger.debug(f"Output logits shape: {logits.shape}")
+    results = prof.key_averages().table(sort_by=sort_by_keyword, row_limit=10)
+
+    logger.info(f"{results}")
+    
+    prof.export_chrome_trace(f"./single_epoch_forward_backward_pass_batch_size_{batch_size}.json")
 
 
 
 def main():
     """Main entry point of the script."""
-   
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch_size', type=int, default=512,help='batch size')
+    parser.add_argument('--timer', action='store_true', help='time the forward pass')
+    parser.add_argument('--backward', action='store_true', help='Profile backward pass. If not set, will profile forward pass.')
+    parser.add_argument('--tensorboard', type=str, default="tensorboard_profiling", help='Tensorboard log directory')
+
+    input_args = parser.parse_args()
+
     args_val = ["datasets/JetClass/Pythia/val_5M/*.root"]
     args_train = ['HToBB:datasets/JetClass/Pythia/train_100M/HToBB_*.root', 'HToCC:datasets/JetClass/Pythia/train_100M/HToCC_*.root', 'HToGG:datasets/JetClass/Pythia/train_100M/HToGG_*.root', 'HToWW2Q1L:datasets/JetClass/Pythia/train_100M/HToWW2Q1L_*.root', 'HToWW4Q:datasets/JetClass/Pythia/train_100M/HToWW4Q_*.root', 'TTBar:datasets/JetClass/Pythia/train_100M/TTBar_*.root', 'TTBarLep:datasets/JetClass/Pythia/train_100M/TTBarLep_*.root', 'WToQQ:datasets/JetClass/Pythia/train_100M/WToQQ_*.root', 'ZToQQ:datasets/JetClass/Pythia/train_100M/ZToQQ_*.root', 'ZJetsToNuNu:datasets/JetClass/Pythia/train_100M/ZJetsToNuNu_*.root']
     args_test = ['HToBB:datasets/JetClass/Pythia/test_20M/HToBB_*.root' 'HToCC:datasets/JetClass/Pythia/test_20M/HToCC_*.root' 'HToGG:datasets/JetClass/Pythia/test_20M/HToGG_*.root' 'HToWW2Q1L:datasets/JetClass/Pythia/test_20M/HToWW2Q1L_*.root' 'HToWW4Q:datasets/JetClass/Pythia/test_20M/HToWW4Q_*.root' 'TTBar:datasets/JetClass/Pythia/test_20M/TTBar_*.root' 'TTBarLep:datasets/JetClass/Pythia/test_20M/TTBarLep_*.root' 'WToQQ:datasets/JetClass/Pythia/test_20M/WToQQ_*.root' 'ZToQQ:datasets/JetClass/Pythia/test_20M/ZToQQ_*.root' 'ZJetsToNuNu:datasets/JetClass/Pythia/test_20M/ZJetsToNuNu_*.root']
@@ -484,25 +592,46 @@ def main():
     logger.info(f"Using device {dev}")
 
     set_up_logging()
-    train_data, val_data, data_config = get_datasets(args)
+    train_data, val_data, data_config = get_datasets(args, input_args)
 
-    train_loader, val_loader = get_dataloaders(train_data, val_data, args)
+    train_loader, val_loader = get_dataloaders(train_data, val_data, input_args.batch_size)
 
 
     n_batch_list = get_first_n_batches(n=2, train_loader=train_loader)
         
-    model, model_info, _loss_func = model_setup(args, data_config, device=dev)
+    model, model_info, loss_func = model_setup(args, data_config, device=dev)
     model.to(dev)
     logger.info(f"{model_info=}")
     
 
-    steps_per_epoch = args.samples_per_epoch // args.batch_size
-    _steps_per_epoch_val = args.samples_per_epoch_val // args.batch_size
+    steps_per_epoch = args.samples_per_epoch // input_args.batch_size
+    _steps_per_epoch_val = args.samples_per_epoch_val // input_args.batch_size
 
+
+    if args.timer:
+        start_time = time.time()
+        call_forward_pass(model, train_loader, data_config, dev, steps_per_epoch, input_args.batch_size, timer=True)
+        elapsed_time = time.time() - start_time
+        logger.info(f"Elapsed time: {elapsed_time:.2f}s")
+        return
 
     # Runs over a single epoch
-    call_forward_pass(model, train_loader, data_config, dev, steps_per_epoch)
+    if not input_args.backward:
+        call_forward_pass(model, train_loader, data_config, dev, steps_per_epoch, input_args.batch_size, timer=False)
+    else:
+        call_forward_and_backward_pass(args, model, loss_func, train_loader, data_config, dev, steps_per_epoch, input_args.batch_size)
 
-    return args, data_config, train_loader, val_loader, n_batch_list
+
+    def _standard_model_forward_backward_pass():
+        from weaver.utils.nn.tools import TensorboardHelper
+        tb = TensorboardHelper(tb_comment=input_args.tensorboard, tb_custom_fn=None)
+        grad_scaler = torch.amp.GradScaler(device=dev)
+        opt, scheduler = optim(args, model, dev)
+        train(model, loss_func, opt, scheduler, train_loader, dev, epoch=0,
+                  steps_per_epoch=steps_per_epoch, grad_scaler=grad_scaler, tb_helper=tb)
+        
+    
+
+    return
 if __name__ == "__main__":
     main()
