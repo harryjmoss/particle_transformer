@@ -330,11 +330,16 @@ class ArgumentsObject:
     fetch_step: float = 0.01
     batch_size: int = 512
     start_lr: float = 1e-3
+    lr_finder: str = None
+    lr_scheduler: str = "flat+decay"
+    warmup_Steps: int = 0
     samples_per_epoch: int = 513
     samples_per_epoch_val: int = 513
     num_epochs: int = 1
     gpus: str = ""
     optimizer: str = "ranger"
+    optimizer_option: list = field(default_factory=list)
+    load_epoch: int = None
     log: str = "logs/JetClass_Pythia_full_ParT_{auto}.log"
     predict_output: str = "pred.root"
     tensorboard: str = "JetClass_Pythia_full_ParT"
@@ -458,6 +463,7 @@ def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor],
         dev (torch.device): Pytorch device to run the model on.
         batch_size (int): Batch size.
     """
+    logger.info("Profiling forward pass ONLY!")
     # turn off gradient accumulation...
     model.eval()
     if dev.type == "cuda":
@@ -479,11 +485,15 @@ def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor],
     results = prof.key_averages().table(sort_by=sort_by_keyword, row_limit=10)
 
     logger.info(f"{results}")
-    
-    prof.export_chrome_trace(f"./single_epoch_forward_pass_batch_size_{batch_size}.json")
+    tensorboard_log_dir = f"./tensorboard_logs_forward/batch_size_{batch_size}"
+    os.makedirs(tensorboard_log_dir, exist_ok=True)
+
+    tensorboard_handler = torch.profiler.tensorboard_trace_handler(tensorboard_log_dir)
+    tensorboard_handler(prof)
+    #prof.export_chrome_trace(f"./single_epoch_forward_pass_batch_size_{batch_size}.json")
 
 
-def call_forward_and_backward_pass(args: ArgumentsObject, model: ParticleTransformer, training_input: DataLoader, data_config: dict, dev: torch.device, steps_per_epoch: int, batch_size: int) -> None:
+def call_forward_and_backward_pass(args: ArgumentsObject, model: ParticleTransformer, loss_func: torch.nn.modules.loss._Loss, training_input: DataLoader, data_config: dict, dev: torch.device, steps_per_epoch: int, batch_size: int) -> None:
     """Call the forward pass of the model.
 
     Args:
@@ -496,7 +506,7 @@ def call_forward_and_backward_pass(args: ArgumentsObject, model: ParticleTransfo
         batch_size (int): Batch size.
     """
     num_batches = 0
-    opt = optim(args, model, dev)
+    opt, _scheduler = optim(args, model, dev)
     for X, y, _ in tqdm(training_input):
         inputs = [X[k].to(dev) for k in data_config.input_names]
         label = y[data_config.label_names[0]].long().to(dev)
@@ -507,7 +517,7 @@ def call_forward_and_backward_pass(args: ArgumentsObject, model: ParticleTransfo
         
         logger.info(f"inputs: {inputs}\nlabels: {label}\nmask: {mask}")
 
-        profile_forward_backward_pass(opt, model, inputs, mask, label, dev, batch_size)
+        profile_forward_backward_pass(opt, model, loss_func, inputs, mask, label, dev, batch_size)
         num_batches += 1
 
         if num_batches >= steps_per_epoch:
@@ -540,6 +550,7 @@ def profile_forward_backward_pass(
         dev (torch.device): Pytorch device to run the model on.
         batch_size (int): Batch size.
     """
+    logger.info("Debugging backward passes!")
     if dev.type == "cuda":
         sort_by_keyword = "self_" + dev.type + "_time_total"
     else:
@@ -555,19 +566,26 @@ def profile_forward_backward_pass(
     ) as prof:
         
         opt.zero_grad()
-        with torch.amp.autocast(dev):
+        with torch.amp.autocast("cuda"):
             model_output = model(*inputs)
             logits, label, _ = _flatten_preds(model_output, label=label, mask=mask)
             loss = loss_func(logits, label)
             loss.backward()
             opt.step()
-        
+
+
     logger.debug(f"Output logits shape: {logits.shape}")
     results = prof.key_averages().table(sort_by=sort_by_keyword, row_limit=10)
 
     logger.info(f"{results}")
     
-    prof.export_chrome_trace(f"./single_epoch_forward_backward_pass_batch_size_{batch_size}.json")
+    tensorboard_log_dir = f"./tensorboard_logs_forward_and_backward/batch_size_{batch_size}"
+    os.makedirs(tensorboard_log_dir, exist_ok=True)
+
+    tensorboard_handler = torch.profiler.tensorboard_trace_handler(tensorboard_log_dir)
+    tensorboard_handler(prof)
+
+    #prof.export_chrome_trace(f"./single_epoch_forward_backward_pass_batch_size_{batch_size}.json")
 
 
 
@@ -575,8 +593,8 @@ def main():
     """Main entry point of the script."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch_size', type=int, default=512,help='batch size')
-    parser.add_argument('--timer', action='store_true', help='time the forward pass')
-    parser.add_argument('--backward', action='store_true', help='Profile backward pass. If not set, will profile forward pass.')
+    parser.add_argument('--timer', action='store_true', default=False, help='time the forward pass')
+    parser.add_argument('--backward', action='store_true', default=False, help='Profile backward pass. If not set, will profile forward pass.')
     parser.add_argument('--tensorboard', type=str, default="tensorboard_profiling", help='Tensorboard log directory')
 
     input_args = parser.parse_args()
@@ -592,7 +610,7 @@ def main():
     logger.info(f"Using device {dev}")
 
     set_up_logging()
-    train_data, val_data, data_config = get_datasets(args, input_args)
+    train_data, val_data, data_config = get_datasets(args)
 
     train_loader, val_loader = get_dataloaders(train_data, val_data, input_args.batch_size)
 
@@ -608,7 +626,7 @@ def main():
     _steps_per_epoch_val = args.samples_per_epoch_val // input_args.batch_size
 
 
-    if args.timer:
+    if input_args.timer:
         start_time = time.time()
         call_forward_pass(model, train_loader, data_config, dev, steps_per_epoch, input_args.batch_size, timer=True)
         elapsed_time = time.time() - start_time
