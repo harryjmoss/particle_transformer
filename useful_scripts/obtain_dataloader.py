@@ -13,6 +13,8 @@ from tqdm import tqdm
 from concurrent.futures.thread import ThreadPoolExecutor
 import argparse
 
+
+from pathlib import Path
 from weaver.utils.nn.tools import train_classification as train
 from weaver.utils.nn.tools import evaluate_classification as evaluate
 from weaver.train import to_filelist, optim
@@ -437,7 +439,7 @@ def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, da
         except KeyError:
             mask = None
         
-        logger.info(f"inputs: {inputs}\nlabels: {label}\nmask: {mask}")
+        logger.debug(f"inputs: {inputs}\nlabels: {label}\nmask: {mask}")
 
         if timer:
             model.eval()
@@ -605,7 +607,9 @@ def main():
     
     args = ArgumentsObject(args_val, args_train, args_test)
     #dev = torch.device(0) if args.gpus == "0" else torch.device("cpu")
-    
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
+
     dev = torch.device(0) if torch.cuda.is_available() else torch.device("cpu")
     logger.info(f"Using device {dev}")
 
@@ -615,7 +619,7 @@ def main():
     train_loader, val_loader = get_dataloaders(train_data, val_data, input_args.batch_size)
 
 
-    n_batch_list = get_first_n_batches(n=2, train_loader=train_loader)
+    #n_batch_list = get_first_n_batches(n=2, train_loader=train_loader)
         
     model, model_info, loss_func = model_setup(args, data_config, device=dev)
     model.to(dev)
@@ -627,10 +631,19 @@ def main():
 
 
     if input_args.timer:
-        start_time = time.time()
+        start_wall_time = time.time()
+        start_cpu_time = time.process_time()
         call_forward_pass(model, train_loader, data_config, dev, steps_per_epoch, input_args.batch_size, timer=True)
-        elapsed_time = time.time() - start_time
-        logger.info(f"Elapsed time: {elapsed_time:.2f}s")
+        elapsed_wall_time = time.time() - start_wall_time
+        elapsed_cpu_time = time.process_time() - start_cpu_time
+
+        output_times_file = Path(f"./time_log_forward_pass_batch_{input_args.batch_size}.txt")
+        with output_times_file.open("w") as outfile:
+            outfile.write(f"Elapsed wall time: {elapsed_wall_time:.2f}s\nElapsed cpu time: {elapsed_cpu_time:.2f}s")
+        logger.info(f"Elapsed wall time: {elapsed_wall_time:.2f}s")
+        logger.info(f"Elapsed cpu time: {elapsed_cpu_time:.2f}s")
+
+
         return
 
     # Runs over a single epoch
