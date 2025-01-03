@@ -1,41 +1,29 @@
-import os
-import sys
-import torch
+import argparse
 import copy
 import json
-import time
 import logging
-import numpy as np
-import awkward as ak
+import os
+import sys
+import time
+from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
+
+import awkward as ak
+import numpy as np
+import torch
+from loguru import logger
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from concurrent.futures.thread import ThreadPoolExecutor
-import argparse
-
-
-from pathlib import Path
-from weaver.utils.nn.tools import train_classification as train
-from weaver.utils.nn.tools import evaluate_classification as evaluate
-from weaver.train import to_filelist, optim
+from weaver.nn.model.ParticleTransformer import ParticleTransformer
+from weaver.train import model_setup, optim, to_filelist
+from weaver.utils.data.config import DataConfig, _md5
+from weaver.utils.data.preprocess import AutoStandardizer, WeightMaker
+from weaver.utils.dataset import _collate_awkward_array_fn, _load_next
 from weaver.utils.nn.tools import _flatten_preds
 
-
-from weaver.utils.dataset import (
-    _collate_awkward_array_fn,
-    _finalize_inputs,
-    _get_reweight_indices,
-    _check_labels,
-    _preprocess,
-    _load_next
-)
-from weaver.utils.data.preprocess import AutoStandardizer, WeightMaker
-from weaver.utils.data.config import DataConfig, _md5
-from weaver.train import model_setup
-from weaver.nn.model.ParticleTransformer import ParticleTransformer
-from loguru import logger
-
 training_mode = True
+
 
 class _SimpleIter(object):
     r"""_SimpleIter
@@ -44,6 +32,8 @@ class _SimpleIter(object):
     """
 
     def __init__(self, **kwargs):
+        """Constructor.
+        """
         # inherit all properties from SimpleIterDataset
         self.__dict__.update(**kwargs)
 
@@ -61,14 +51,14 @@ class _SimpleIter(object):
         file_dict = copy.deepcopy(self._init_file_dict)
         if worker_info is not None:
             # in a worker process
-            self._name += '_worker%d' % worker_info.id
+            self._name += "_worker%d" % worker_info.id
             self._seed = worker_info.seed & 0xFFFFFFFF
             np.random.seed(self._seed)
             # split workload by files
             new_file_dict = {}
             for name, files in file_dict.items():
-                new_files = files[worker_info.id::worker_info.num_workers]
-                assert (len(new_files) > 0)
+                new_files = files[worker_info.id :: worker_info.num_workers]
+                assert len(new_files) > 0
                 new_file_dict[name] = new_files
             file_dict = new_file_dict
         self.worker_file_dict = file_dict
@@ -77,11 +67,14 @@ class _SimpleIter(object):
         self.restart()
 
     def restart(self):
-        logger.info('=== MODIFIED VERSION! Restarting DataIter %s, seed=%s ===' % (self._name, self._seed))
+        logger.info(
+            "=== MODIFIED VERSION! Restarting DataIter %s, seed=%s ==="
+            % (self._name, self._seed)
+        )
         # re-shuffle filelist and load range if for training
         filelist = copy.deepcopy(self.worker_filelist)
         logger.info("Copied file list.")
-        if self._sampler_options['shuffle']:
+        if self._sampler_options["shuffle"]:
             np.random.shuffle(filelist)
             logger.info("Shuffled data")
         if self._file_fraction < 1:
@@ -97,23 +90,32 @@ class _SimpleIter(object):
 
             (start_pos, end_pos), load_frac = self._init_load_range_and_fraction
             interval = (end_pos - start_pos) * load_frac
-            if self._sampler_options['shuffle']:
+            if self._sampler_options["shuffle"]:
                 offset = np.random.uniform(start_pos, end_pos - interval)
                 self.load_range = (offset, offset + interval)
             else:
                 self.load_range = (start_pos, start_pos + interval)
 
         logger.debug(
-            'Init iter [%d], will load %d (out of %d*%s=%d) files with load_range=%s:\n%s', 0
-            if self.worker_info is None else self.worker_info.id, len(self.filelist),
+            "Init iter [%d], will load %d (out of %d*%s=%d) files with load_range=%s:\n%s",
+            0 if self.worker_info is None else self.worker_info.id,
+            len(self.filelist),
             len(sum(self._init_file_dict.values(), [])),
-            self._file_fraction, int(len(sum(self._init_file_dict.values(), [])) * self._file_fraction),
+            self._file_fraction,
+            int(len(sum(self._init_file_dict.values(), [])) * self._file_fraction),
             str(self.load_range),
-            '\n'.join(self.filelist[: 3]) + '\n ... ' + self.filelist[-1],)
+            "\n".join(self.filelist[:3]) + "\n ... " + self.filelist[-1],
+        )
 
         logger.info("Restarted DataIter")
-        logger.debug('Restarted DataIter %s, load_range=%s, file_list:\n%s' %
-                     (self._name, str(self.load_range), json.dumps(self.worker_file_dict, indent=2)))
+        logger.debug(
+            "Restarted DataIter %s, load_range=%s, file_list:\n%s"
+            % (
+                self._name,
+                str(self.load_range),
+                json.dumps(self.worker_file_dict, indent=2),
+            )
+        )
 
         # reset file fetching cursor
         self.ipos = 0 if self._fetch_by_files else self.load_range[0]
@@ -132,7 +134,7 @@ class _SimpleIter(object):
             while True:
                 if self._in_memory and len(self.indices) > 0:
                     # only need to re-shuffle the indices, if this is not the first entry
-                    if self._sampler_options['shuffle']:
+                    if self._sampler_options["shuffle"]:
                         np.random.shuffle(self.indices)
                     break
                 if self.prefetch is None:
@@ -147,7 +149,7 @@ class _SimpleIter(object):
                 else:
                     self.table, self.indices = self.prefetch
                 # try to load the next ones asynchronously
-#               self._try_get_next()
+                #               self._try_get_next()
                 # check if any entries are fetched (i.e., passing selection) -- if not, do another fetch
                 if len(self.indices) > 0:
                     break
@@ -158,11 +160,18 @@ class _SimpleIter(object):
         return self.get_data(i)
 
     def _try_get_next(self, init=False):
-        end_of_list = self.ipos >= len(self.filelist) if self._fetch_by_files else self.ipos >= self.load_range[1]
+        end_of_list = (
+            self.ipos >= len(self.filelist)
+            if self._fetch_by_files
+            else self.ipos >= self.load_range[1]
+        )
         if end_of_list:
             if init:
-                raise RuntimeError('Nothing to load for worker %d' %
-                                   0 if self.worker_info is None else self.worker_info.id)
+                raise RuntimeError(
+                    "Nothing to load for worker %d" % 0
+                    if self.worker_info is None
+                    else self.worker_info.id
+                )
             if self._infinity_mode and not self._in_memory:
                 # infinity mode: re-start
                 self.restart()
@@ -173,25 +182,41 @@ class _SimpleIter(object):
                 return
 
         if self._fetch_by_files:
-            filelist = self.filelist[int(self.ipos): int(self.ipos + self._fetch_step)]
+            filelist = self.filelist[int(self.ipos) : int(self.ipos + self._fetch_step)]
             load_range = self.load_range
         else:
             filelist = self.filelist
-            load_range = (self.ipos, min(self.ipos + self._fetch_step, self.load_range[1]))
+            load_range = (
+                self.ipos,
+                min(self.ipos + self._fetch_step, self.load_range[1]),
+            )
 
-        logger.info('Start fetching next batch, len(filelist)=%d, load_range=%s'%(len(filelist), load_range))
+        logger.info(
+            "Start fetching next batch, len(filelist)=%d, load_range=%s"
+            % (len(filelist), load_range)
+        )
         if self._async_load:
             logger.info("Using async prefetch logic")
-            self.prefetch = self.executor.submit(_load_next, self._data_config,
-                                                 filelist, load_range, self._sampler_options)
+            self.prefetch = self.executor.submit(
+                _load_next,
+                self._data_config,
+                filelist,
+                load_range,
+                self._sampler_options,
+            )
         else:
             logger.info("Using sync prefetch logic")
-            self.prefetch = _load_next(self._data_config, filelist, load_range, self._sampler_options)
+            self.prefetch = _load_next(
+                self._data_config, filelist, load_range, self._sampler_options
+            )
         self.ipos += self._fetch_step
 
     def get_data(self, i):
         # inputs
-        X = {k: copy.deepcopy(self.table['_' + k][i]) for k in self._data_config.input_names}
+        X = {
+            k: copy.deepcopy(self.table["_" + k][i])
+            for k in self._data_config.input_names
+        }
         # labels
         y = {k: copy.deepcopy(self.table[k][i]) for k in self._data_config.label_names}
         # observers / monitor variables
@@ -223,10 +248,25 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
         file_fraction (float): fraction of files to load.
     """
 
-    def __init__(self, file_dict, data_config_file,
-                 for_training=True, load_range_and_fraction=None, extra_selection=None,
-                 fetch_by_files=False, fetch_step=0.01, file_fraction=1, remake_weights=False, up_sample=True,
-                 weight_scale=1, max_resample=10, async_load=True, infinity_mode=False, in_memory=False, name=''):
+    def __init__(
+        self,
+        file_dict,
+        data_config_file,
+        for_training=True,
+        load_range_and_fraction=None,
+        extra_selection=None,
+        fetch_by_files=False,
+        fetch_step=0.01,
+        file_fraction=1,
+        remake_weights=False,
+        up_sample=True,
+        weight_scale=1,
+        max_resample=10,
+        async_load=True,
+        infinity_mode=False,
+        in_memory=False,
+        name="",
+    ):
         self._iters = {} if infinity_mode or in_memory else None
         _init_args = set(self.__dict__.keys())
         self._init_file_dict = file_dict
@@ -241,13 +281,14 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
 
         # ==== sampling parameters ====
         self._sampler_options = {
-            'up_sample': up_sample,
-            'weight_scale': weight_scale,
-            'max_resample': max_resample,
+            "up_sample": up_sample,
+            "weight_scale": weight_scale,
+            "max_resample": max_resample,
         }
 
         # ==== torch collate_fn map ====
         from torch.utils.data._utils.collate import default_collate_fn_map
+
         default_collate_fn_map.update({ak.Array: _collate_awkward_array_fn})
 
         if for_training:
@@ -256,15 +297,19 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
             self._sampler_options.update(training=False, shuffle=False, reweight=False)
 
         # discover auto-generated reweight file
-        if '.auto.yaml' in data_config_file:
+        if ".auto.yaml" in data_config_file:
             data_config_autogen_file = data_config_file
         else:
             data_config_md5 = _md5(data_config_file)
-            data_config_autogen_file = data_config_file.replace('.yaml', '.%s.auto.yaml' % data_config_md5)
+            data_config_autogen_file = data_config_file.replace(
+                ".yaml", ".%s.auto.yaml" % data_config_md5
+            )
             if os.path.exists(data_config_autogen_file):
                 data_config_file = data_config_autogen_file
-                logger.info('Found file %s w/ auto-generated preprocessing information, will use that instead!' %
-                             data_config_file)
+                logger.info(
+                    "Found file %s w/ auto-generated preprocessing information, will use that instead!"
+                    % data_config_file
+                )
 
         # load data config (w/ observers now -- so they will be included in the auto-generated yaml)
         self._data_config = DataConfig.load(data_config_file)
@@ -276,21 +321,34 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
                 self._data_config = s.produce(data_config_autogen_file)
 
             # produce reweight info if needed
-            if self._sampler_options['reweight'] and self._data_config.weight_name and not self._data_config.use_precomputed_weights:
+            if (
+                self._sampler_options["reweight"]
+                and self._data_config.weight_name
+                and not self._data_config.use_precomputed_weights
+            ):
                 if remake_weights or self._data_config.reweight_hists is None:
                     w = WeightMaker(file_dict, self._data_config)
                     self._data_config = w.produce(data_config_autogen_file)
 
             # reload data_config w/o observers for training
-            if os.path.exists(data_config_autogen_file) and data_config_file != data_config_autogen_file:
+            if (
+                os.path.exists(data_config_autogen_file)
+                and data_config_file != data_config_autogen_file
+            ):
                 data_config_file = data_config_autogen_file
                 logger.info(
-                    'Found file %s w/ auto-generated preprocessing information, will use that instead!' %
-                    data_config_file)
-            self._data_config = DataConfig.load(data_config_file, load_observers=False, extra_selection=extra_selection)
+                    "Found file %s w/ auto-generated preprocessing information, will use that instead!"
+                    % data_config_file
+                )
+            self._data_config = DataConfig.load(
+                data_config_file, load_observers=False, extra_selection=extra_selection
+            )
         else:
             self._data_config = DataConfig.load(
-                data_config_file, load_reweight_info=False, extra_test_selection=extra_selection)
+                data_config_file,
+                load_reweight_info=False,
+                extra_test_selection=extra_selection,
+            )
 
         # derive all variables added to self.__dict__
         self._init_args = set(self.__dict__.keys()) - _init_args
@@ -347,41 +405,83 @@ class ArgumentsObject:
     tensorboard: str = "JetClass_Pythia_full_ParT"
 
 
-
 def get_datasets(args: ArgumentsObject):
-    
-
     train_file_dict, _train_files = to_filelist(args, "train")
 
     val_file_dict, _val_files = to_filelist(args, "val")
 
     train_range = val_range = (0, 1)
-    
-    train_data = SimpleIterDataset(train_file_dict, args.data_config, for_training=True, extra_selection=None, remake_weights=True, load_range_and_fraction=(train_range, 1), file_fraction=1, fetch_by_files=False, fetch_step=0.01, infinity_mode=False, in_memory=False, name="train" + (""))
-    val_data = SimpleIterDataset(val_file_dict, args.data_config, for_training=True, extra_selection=None, load_range_and_fraction=(val_range, 1), file_fraction=1, fetch_by_files=False, fetch_step=0.01, infinity_mode=False, in_memory=False, name="val" + (""))
+
+    train_data = SimpleIterDataset(
+        train_file_dict,
+        args.data_config,
+        for_training=True,
+        extra_selection=None,
+        remake_weights=True,
+        load_range_and_fraction=(train_range, 1),
+        file_fraction=1,
+        fetch_by_files=False,
+        fetch_step=0.01,
+        infinity_mode=False,
+        in_memory=False,
+        name="train" + (""),
+    )
+    val_data = SimpleIterDataset(
+        val_file_dict,
+        args.data_config,
+        for_training=True,
+        extra_selection=None,
+        load_range_and_fraction=(val_range, 1),
+        file_fraction=1,
+        fetch_by_files=False,
+        fetch_step=0.01,
+        infinity_mode=False,
+        in_memory=False,
+        name="val" + (""),
+    )
 
     data_config = train_data.config
 
     return train_data, val_data, data_config
 
-def get_dataloaders(train_data: SimpleIterDataset, val_data: SimpleIterDataset, batch_size: int):
 
-    train_loader = DataLoader(train_data, batch_size=batch_size, drop_last=True, pin_memory=True, num_workers=0, persistent_workers=False)
-    val_loader = DataLoader(val_data, batch_size=batch_size, drop_last=True, pin_memory=True, num_workers=0, persistent_workers=False)
-
+def get_dataloaders(
+    train_data: SimpleIterDataset, val_data: SimpleIterDataset, batch_size: int
+):
+    train_loader = DataLoader(
+        train_data,
+        batch_size=batch_size,
+        drop_last=True,
+        pin_memory=True,
+        num_workers=0,
+        persistent_workers=False,
+    )
+    val_loader = DataLoader(
+        val_data,
+        batch_size=batch_size,
+        drop_last=True,
+        pin_memory=True,
+        num_workers=0,
+        persistent_workers=False,
+    )
 
     return train_loader, val_loader
 
+
 class InterceptHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
-        logger.opt(depth=6, exception=record.exc_info).log(record.levelno, record.getMessage())
+        logger.opt(depth=6, exception=record.exc_info).log(
+            record.levelno, record.getMessage()
+        )
+
 
 def set_up_logging():
     """Redirects the logging to the loguru logger."""
 
-    logger.remove() 
+    logger.remove()
     logger.add(sys.stdout, level="INFO")
     logging.basicConfig(handlers=[InterceptHandler()], level="INFO")
+
 
 def get_first_n_batches(n: int, train_loader: DataLoader) -> list[torch.Tensor]:
     """Get the first n batches from the train_loader.
@@ -397,10 +497,9 @@ def get_first_n_batches(n: int, train_loader: DataLoader) -> list[torch.Tensor]:
     start_time = time.time()
 
     batch_list = []
-    
-    
+
     for i, batch in enumerate(train_loader):
-        if i==0:
+        if i == 0:
             first_batch_loaded_time = time.time()
             elapsed_time = first_batch_loaded_time - start_time
             batch_length = len(batch)
@@ -410,15 +509,26 @@ def get_first_n_batches(n: int, train_loader: DataLoader) -> list[torch.Tensor]:
             pf_mask_shape = batch[0]["pf_mask"].shape
 
             logger.debug(f"{batch[0].keys()}")
-            logger.debug(f"{batch_length=}, {pf_points_shape=}, {pf_features_shape=}, {pf_vectors_shape=}, {pf_mask_shape=}")
+            logger.debug(
+                f"{batch_length=}, {pf_points_shape=}, {pf_features_shape=}, {pf_vectors_shape=}, {pf_mask_shape=}"
+            )
             logger.debug(f"Single batch loading time {elapsed_time:.2f}s")
-        if i<n:
+        if i < n:
             batch_list.append(batch)
         else:
             break
     return batch_list
 
-def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, data_config: dict, dev: torch.device, steps_per_epoch: int, batch_size: int, timer: bool) -> None:
+
+def call_forward_pass(
+    model: ParticleTransformer,
+    training_input: DataLoader,
+    data_config: dict,
+    dev: torch.device,
+    steps_per_epoch: int,
+    batch_size: int,
+    timer: bool,
+) -> None:
     """Call the forward pass of the model.
 
     Args:
@@ -438,13 +548,13 @@ def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, da
             mask = y[data_config.label_names[0] + "_mask"].bool().to(dev)
         except KeyError:
             mask = None
-        
+
         logger.debug(f"inputs: {inputs}\nlabels: {label}\nmask: {mask}")
 
         if timer:
             model.eval()
             model(*inputs)
-        
+
         else:
             profile_forward_pass(model, inputs, dev, batch_size=batch_size)
 
@@ -452,11 +562,18 @@ def call_forward_pass(model: ParticleTransformer, training_input: DataLoader, da
 
         if num_batches >= steps_per_epoch:
             input_shapes = [k.shape for k in inputs]
-            logger.info(f"Processed {num_batches} batches of inputs with shape {input_shapes}")
+            logger.info(
+                f"Processed {num_batches} batches of inputs with shape {input_shapes}"
+            )
             break
 
 
-def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor], dev: torch.device, batch_size: int) -> None:
+def profile_forward_pass(
+    model: ParticleTransformer,
+    inputs: list[torch.Tensor],
+    dev: torch.device,
+    batch_size: int,
+) -> None:
     """Profile the forward pass of the model.
 
     Args:
@@ -479,9 +596,8 @@ def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor],
         ],
         with_flops=True,
         profile_memory=True,
-        #on_trace_ready=torch.profiler.tensorboard_trace_handler("tensorboard_logs_forward")
+        # on_trace_ready=torch.profiler.tensorboard_trace_handler("tensorboard_logs_forward")
     ) as prof:
-        
         _outputs = model(*inputs)
     logger.debug(f"Outputs shape: {_outputs.shape}")
     results = prof.key_averages().table(sort_by=sort_by_keyword, row_limit=10)
@@ -492,10 +608,19 @@ def profile_forward_pass(model: ParticleTransformer, inputs: list[torch.Tensor],
 
     tensorboard_handler = torch.profiler.tensorboard_trace_handler(tensorboard_log_dir)
     tensorboard_handler(prof)
-    #prof.export_chrome_trace(f"./single_epoch_forward_pass_batch_size_{batch_size}.json")
+    # prof.export_chrome_trace(f"./single_epoch_forward_pass_batch_size_{batch_size}.json")
 
 
-def call_forward_and_backward_pass(args: ArgumentsObject, model: ParticleTransformer, loss_func: torch.nn.modules.loss._Loss, training_input: DataLoader, data_config: dict, dev: torch.device, steps_per_epoch: int, batch_size: int) -> None:
+def call_forward_and_backward_pass(
+    args: ArgumentsObject,
+    model: ParticleTransformer,
+    loss_func: torch.nn.modules.loss._Loss,
+    training_input: DataLoader,
+    data_config: dict,
+    dev: torch.device,
+    steps_per_epoch: int,
+    batch_size: int,
+) -> None:
     """Call the forward pass of the model.
 
     Args:
@@ -516,30 +641,32 @@ def call_forward_and_backward_pass(args: ArgumentsObject, model: ParticleTransfo
             mask = y[data_config.label_names[0] + "_mask"].bool().to(dev)
         except KeyError:
             mask = None
-        
+
         logger.info(f"inputs: {inputs}\nlabels: {label}\nmask: {mask}")
 
-        profile_forward_backward_pass(opt, model, loss_func, inputs, mask, label, dev, batch_size)
+        profile_forward_backward_pass(
+            opt, model, loss_func, inputs, mask, label, dev, batch_size
+        )
         num_batches += 1
 
         if num_batches >= steps_per_epoch:
             input_shapes = [k.shape for k in inputs]
-            logger.info(f"Processed {num_batches} batches of inputs with shape {input_shapes}")
+            logger.info(
+                f"Processed {num_batches} batches of inputs with shape {input_shapes}"
+            )
             break
 
 
-
-
 def profile_forward_backward_pass(
-        opt: torch.optim,
-        model: ParticleTransformer,
-        loss_func: torch.nn.modules.loss._Loss,
-        inputs: list[torch.Tensor],
-        mask: list[torch.Tensor],
-        label: list[torch.Tensor],
-        dev: torch.device,
-        batch_size: int
-    ) -> None:
+    opt: torch.optim,
+    model: ParticleTransformer,
+    loss_func: torch.nn.modules.loss._Loss,
+    inputs: list[torch.Tensor],
+    mask: list[torch.Tensor],
+    label: list[torch.Tensor],
+    dev: torch.device,
+    batch_size: int,
+) -> None:
     """Profile the backward pass of the model.
 
     Args:
@@ -564,9 +691,8 @@ def profile_forward_backward_pass(
         ],
         with_flops=True,
         profile_memory=True,
-        #on_trace_ready=torch.profiler.tensorboard_trace_handler("tensorboard_logs_backward")
+        # on_trace_ready=torch.profiler.tensorboard_trace_handler("tensorboard_logs_backward")
     ) as prof:
-        
         opt.zero_grad()
         with torch.amp.autocast("cuda"):
             model_output = model(*inputs)
@@ -575,38 +701,72 @@ def profile_forward_backward_pass(
             loss.backward()
             opt.step()
 
-
     logger.debug(f"Output logits shape: {logits.shape}")
     results = prof.key_averages().table(sort_by=sort_by_keyword, row_limit=10)
 
     logger.info(f"{results}")
-    
-    tensorboard_log_dir = f"./tensorboard_logs_forward_and_backward/batch_size_{batch_size}"
+
+    tensorboard_log_dir = (
+        f"./tensorboard_logs_forward_and_backward/batch_size_{batch_size}"
+    )
     os.makedirs(tensorboard_log_dir, exist_ok=True)
 
     tensorboard_handler = torch.profiler.tensorboard_trace_handler(tensorboard_log_dir)
     tensorboard_handler(prof)
 
-    #prof.export_chrome_trace(f"./single_epoch_forward_backward_pass_batch_size_{batch_size}.json")
-
+    # prof.export_chrome_trace(f"./single_epoch_forward_backward_pass_batch_size_{batch_size}.json")
 
 
 def main():
     """Main entry point of the script."""
     parser = argparse.ArgumentParser()
-    parser.add_argument('--batch_size', type=int, default=512,help='batch size')
-    parser.add_argument('--timer', action='store_true', default=False, help='time the forward pass')
-    parser.add_argument('--backward', action='store_true', default=False, help='Profile backward pass. If not set, will profile forward pass.')
-    parser.add_argument('--tensorboard', type=str, default="tensorboard_profiling", help='Tensorboard log directory')
+    parser.add_argument("--batch_size", type=int, default=512, help="batch size")
+    parser.add_argument(
+        "--timer", action="store_true", default=False, help="time the forward pass"
+    )
+    parser.add_argument(
+        "--backward",
+        action="store_true",
+        default=False,
+        help="Profile backward pass. If not set, will profile forward pass.",
+    )
+    parser.add_argument(
+        "--tensorboard",
+        type=str,
+        default="tensorboard_profiling",
+        help="Tensorboard log directory",
+    )
 
     input_args = parser.parse_args()
 
     args_val = ["datasets/JetClass/Pythia/val_5M/*.root"]
-    args_train = ['HToBB:datasets/JetClass/Pythia/train_100M/HToBB_*.root', 'HToCC:datasets/JetClass/Pythia/train_100M/HToCC_*.root', 'HToGG:datasets/JetClass/Pythia/train_100M/HToGG_*.root', 'HToWW2Q1L:datasets/JetClass/Pythia/train_100M/HToWW2Q1L_*.root', 'HToWW4Q:datasets/JetClass/Pythia/train_100M/HToWW4Q_*.root', 'TTBar:datasets/JetClass/Pythia/train_100M/TTBar_*.root', 'TTBarLep:datasets/JetClass/Pythia/train_100M/TTBarLep_*.root', 'WToQQ:datasets/JetClass/Pythia/train_100M/WToQQ_*.root', 'ZToQQ:datasets/JetClass/Pythia/train_100M/ZToQQ_*.root', 'ZJetsToNuNu:datasets/JetClass/Pythia/train_100M/ZJetsToNuNu_*.root']
-    args_test = ['HToBB:datasets/JetClass/Pythia/test_20M/HToBB_*.root' 'HToCC:datasets/JetClass/Pythia/test_20M/HToCC_*.root' 'HToGG:datasets/JetClass/Pythia/test_20M/HToGG_*.root' 'HToWW2Q1L:datasets/JetClass/Pythia/test_20M/HToWW2Q1L_*.root' 'HToWW4Q:datasets/JetClass/Pythia/test_20M/HToWW4Q_*.root' 'TTBar:datasets/JetClass/Pythia/test_20M/TTBar_*.root' 'TTBarLep:datasets/JetClass/Pythia/test_20M/TTBarLep_*.root' 'WToQQ:datasets/JetClass/Pythia/test_20M/WToQQ_*.root' 'ZToQQ:datasets/JetClass/Pythia/test_20M/ZToQQ_*.root' 'ZJetsToNuNu:datasets/JetClass/Pythia/test_20M/ZJetsToNuNu_*.root']
-    
+    args_train = [
+        "HToBB:datasets/JetClass/Pythia/train_100M/HToBB_*.root",
+        "HToCC:datasets/JetClass/Pythia/train_100M/HToCC_*.root",
+        "HToGG:datasets/JetClass/Pythia/train_100M/HToGG_*.root",
+        "HToWW2Q1L:datasets/JetClass/Pythia/train_100M/HToWW2Q1L_*.root",
+        "HToWW4Q:datasets/JetClass/Pythia/train_100M/HToWW4Q_*.root",
+        "TTBar:datasets/JetClass/Pythia/train_100M/TTBar_*.root",
+        "TTBarLep:datasets/JetClass/Pythia/train_100M/TTBarLep_*.root",
+        "WToQQ:datasets/JetClass/Pythia/train_100M/WToQQ_*.root",
+        "ZToQQ:datasets/JetClass/Pythia/train_100M/ZToQQ_*.root",
+        "ZJetsToNuNu:datasets/JetClass/Pythia/train_100M/ZJetsToNuNu_*.root",
+    ]
+    args_test = [
+        "HToBB:datasets/JetClass/Pythia/test_20M/HToBB_*.root"
+        "HToCC:datasets/JetClass/Pythia/test_20M/HToCC_*.root"
+        "HToGG:datasets/JetClass/Pythia/test_20M/HToGG_*.root"
+        "HToWW2Q1L:datasets/JetClass/Pythia/test_20M/HToWW2Q1L_*.root"
+        "HToWW4Q:datasets/JetClass/Pythia/test_20M/HToWW4Q_*.root"
+        "TTBar:datasets/JetClass/Pythia/test_20M/TTBar_*.root"
+        "TTBarLep:datasets/JetClass/Pythia/test_20M/TTBarLep_*.root"
+        "WToQQ:datasets/JetClass/Pythia/test_20M/WToQQ_*.root"
+        "ZToQQ:datasets/JetClass/Pythia/test_20M/ZToQQ_*.root"
+        "ZJetsToNuNu:datasets/JetClass/Pythia/test_20M/ZJetsToNuNu_*.root"
+    ]
+
     args = ArgumentsObject(args_val, args_train, args_test)
-    #dev = torch.device(0) if args.gpus == "0" else torch.device("cpu")
+    # dev = torch.device(0) if args.gpus == "0" else torch.device("cpu")
     logger.remove()
     logger.add(sys.stderr, level="INFO")
 
@@ -616,53 +776,71 @@ def main():
     set_up_logging()
     train_data, val_data, data_config = get_datasets(args)
 
-    train_loader, val_loader = get_dataloaders(train_data, val_data, input_args.batch_size)
+    train_loader, val_loader = get_dataloaders(
+        train_data, val_data, input_args.batch_size
+    )
 
+    # n_batch_list = get_first_n_batches(n=2, train_loader=train_loader)
 
-    #n_batch_list = get_first_n_batches(n=2, train_loader=train_loader)
-        
     model, model_info, loss_func = model_setup(args, data_config, device=dev)
     model.to(dev)
     logger.info(f"{model_info=}")
-    
 
     steps_per_epoch = args.samples_per_epoch // input_args.batch_size
     _steps_per_epoch_val = args.samples_per_epoch_val // input_args.batch_size
 
-
     if input_args.timer:
         start_wall_time = time.time()
         start_cpu_time = time.process_time()
-        call_forward_pass(model, train_loader, data_config, dev, steps_per_epoch, input_args.batch_size, timer=True)
+        call_forward_pass(
+            model,
+            train_loader,
+            data_config,
+            dev,
+            steps_per_epoch,
+            input_args.batch_size,
+            timer=True,
+        )
         elapsed_wall_time = time.time() - start_wall_time
         elapsed_cpu_time = time.process_time() - start_cpu_time
 
-        output_times_file = Path(f"./time_log_forward_pass_batch_{input_args.batch_size}.txt")
+        output_times_file = Path(
+            f"./time_log_forward_pass_batch_{input_args.batch_size}.txt"
+        )
         with output_times_file.open("w") as outfile:
-            outfile.write(f"Elapsed wall time: {elapsed_wall_time:.2f}s\nElapsed cpu time: {elapsed_cpu_time:.2f}s")
+            outfile.write(
+                f"Elapsed wall time: {elapsed_wall_time:.2f}s\nElapsed cpu time: {elapsed_cpu_time:.2f}s"
+            )
         logger.info(f"Elapsed wall time: {elapsed_wall_time:.2f}s")
         logger.info(f"Elapsed cpu time: {elapsed_cpu_time:.2f}s")
-
 
         return
 
     # Runs over a single epoch
     if not input_args.backward:
-        call_forward_pass(model, train_loader, data_config, dev, steps_per_epoch, input_args.batch_size, timer=False)
+        call_forward_pass(
+            model,
+            train_loader,
+            data_config,
+            dev,
+            steps_per_epoch,
+            input_args.batch_size,
+            timer=False,
+        )
     else:
-        call_forward_and_backward_pass(args, model, loss_func, train_loader, data_config, dev, steps_per_epoch, input_args.batch_size)
-
-
-    def _standard_model_forward_backward_pass():
-        from weaver.utils.nn.tools import TensorboardHelper
-        tb = TensorboardHelper(tb_comment=input_args.tensorboard, tb_custom_fn=None)
-        grad_scaler = torch.amp.GradScaler(device=dev)
-        opt, scheduler = optim(args, model, dev)
-        train(model, loss_func, opt, scheduler, train_loader, dev, epoch=0,
-                  steps_per_epoch=steps_per_epoch, grad_scaler=grad_scaler, tb_helper=tb)
-        
-    
+        call_forward_and_backward_pass(
+            args,
+            model,
+            loss_func,
+            train_loader,
+            data_config,
+            dev,
+            steps_per_epoch,
+            input_args.batch_size,
+        )
 
     return
+
+
 if __name__ == "__main__":
     main()
